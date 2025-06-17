@@ -3,7 +3,6 @@ import joblib
 import gzip
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score
 from tqdm import tqdm
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -51,6 +50,18 @@ class RecipeModelEvaluator:
         )
         return train_ids, test_ids
     
+    def get_recipe_ingredients(self, recipe_id, conn):
+        """Safely get recipe ingredients with error handling"""
+        cursor = conn.execute(
+            "SELECT ingredients FROM recipes WHERE id=?", 
+            (recipe_id,)
+        )
+        result = cursor.fetchone()
+        if result is None:
+            print(f"Warning: Recipe ID {recipe_id} not found in database")
+            return None
+        return result[0]
+    
     def evaluate(self, k=5, test_size=0.2, sample_size=500):
         """Evaluate model performance with various metrics"""
         # Load model
@@ -71,25 +82,38 @@ class RecipeModelEvaluator:
         recall_sum = 0
         reciprocal_rank_sum = 0
         coverage_count = 0
+        valid_tests = 0
         
         print(f"Evaluating on {len(test_ids)} test recipes...")
         
         for recipe_id in tqdm(test_ids):
             # Get test recipe details
-            cursor = conn.execute(
-                "SELECT ingredients FROM recipes WHERE id=?", 
-                (recipe_id,)
-            )
-            ingredients = cursor.fetchone()[0]
+            ingredients = self.get_recipe_ingredients(recipe_id, conn)
             
+            # Skip if recipe not found
+            if ingredients is None:
+                continue
+                
             # Transform input
-            input_vec = self.vectorizer.transform([ingredients])
+            try:
+                input_vec = self.vectorizer.transform([ingredients])
+            except Exception as e:
+                print(f"Vectorization error for recipe {recipe_id}: {str(e)}")
+                continue
             
             # Get recommendations
-            distances, indices = self.model.kneighbors(input_vec, n_neighbors=k)
+            try:
+                distances, indices = self.model.kneighbors(input_vec, n_neighbors=k)
+            except Exception as e:
+                print(f"Recommendation error for recipe {recipe_id}: {str(e)}")
+                continue
             
             # Get recommended recipe IDs
-            recommended_ids = [self.recipe_ids[i] for i in indices[0]]
+            try:
+                recommended_ids = [self.recipe_ids[i] for i in indices[0]]
+            except IndexError:
+                print(f"Index error for recipe {recipe_id} with indices {indices}")
+                continue
             
             # Calculate metrics
             # Relevance: Only the test recipe is considered relevant
@@ -112,17 +136,27 @@ class RecipeModelEvaluator:
             
             # Coverage
             coverage_count += len(set(recommended_ids))
+            valid_tests += 1
+        
+        # Close database connection
+        conn.close()
+        
+        # Check if we have valid tests
+        if valid_tests == 0:
+            print("Error: No valid recipes for evaluation")
+            return None
         
         # Calculate final metrics
-        precision_avg = precision_sum / len(test_ids)
-        recall_avg = recall_sum / len(test_ids)
-        mrr = reciprocal_rank_sum / len(test_ids)
+        precision_avg = precision_sum / valid_tests
+        recall_avg = recall_sum / valid_tests
+        mrr = reciprocal_rank_sum / valid_tests
         
         # Coverage = unique recommended items / total items
         coverage = coverage_count / len(self.all_recipe_ids)
         
         # Print results
         print("\nEvaluation Results:")
+        print(f"Tested on {valid_tests} valid recipes")
         print(f"Precision@{k}: {precision_avg:.4f}")
         print(f"Recall@{k}: {recall_avg:.4f}")
         print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
@@ -135,7 +169,8 @@ class RecipeModelEvaluator:
             f"precision@{k}": precision_avg,
             f"recall@{k}": recall_avg,
             "mrr": mrr,
-            "coverage": coverage
+            "coverage": coverage,
+            "tested_recipes": valid_tests
         }
     
     def plot_metrics(self, precision, recall, mrr, coverage, k):
@@ -181,14 +216,19 @@ class RecipeModelEvaluator:
                 "SELECT title, ingredients, directions FROM recipes WHERE id=?", 
                 (recipe_id,)
             )
-            title, ingredients, directions = cursor.fetchone()
-            results.append({
-                'id': recipe_id,
-                'title': title,
-                'ingredients': ingredients,
-                'directions': directions,
-                'distance': dist
-            })
+            recipe_data = cursor.fetchone()
+            
+            if recipe_data:
+                title, ingredients, directions = recipe_data
+                results.append({
+                    'id': recipe_id,
+                    'title': title,
+                    'ingredients': ingredients,
+                    'directions': directions,
+                    'distance': dist
+                })
+            else:
+                print(f"Recipe ID {recipe_id} not found in database")
         
         conn.close()
         return results
@@ -204,13 +244,14 @@ if __name__ == "__main__":
     # Evaluate the model
     metrics = evaluator.evaluate(k=5, test_size=0.2, sample_size=1000)
     
-    # Test specific recommendations
-    test_ingredients = "chicken, rice, garlic, onion"
-    print(f"\nTesting recommendations for: {test_ingredients}")
-    results = evaluator.test_recommendations(test_ingredients, k=3)
-    
-    print("\nTop recommendations:")
-    for i, recipe in enumerate(results):
-        print(f"\n{i+1}. {recipe['title']} (Distance: {recipe['distance']:.4f})")
-        print(f"Ingredients: {recipe['ingredients']}")
-        print(f"Directions: {recipe['directions'][:100]}...")
+    if metrics:
+        # Test specific recommendations
+        test_ingredients = "chicken, rice, garlic, onion"
+        print(f"\nTesting recommendations for: {test_ingredients}")
+        results = evaluator.test_recommendations(test_ingredients, k=3)
+        
+        print("\nTop recommendations:")
+        for i, recipe in enumerate(results):
+            print(f"\n{i+1}. {recipe['title']} (Distance: {recipe['distance']:.4f})")
+            print(f"Ingredients: {recipe['ingredients']}")
+            print(f"Directions: {recipe['directions'][:100]}...")
